@@ -45,7 +45,6 @@ export GOROOT := $(BUILDDIR)/goroot
 # which Make correctly parses as a single target name even if the path contains spaces.
 GOROOT_ESCAPED := $(subst $(eval) ,\ ,$(GOROOT))
 $(GOROOT_ESCAPED)/.prepared:
-$(GOROOT_ESCAPED)/.prepared:
 	echo "note: Running '$(GOROOT_ESCAPED)/.prepared' block"
 	echo "note:   Working directory='$(shell pwd)'"
 	echo "note:   REAL_GOROOT='$(REAL_GOROOT)'"
