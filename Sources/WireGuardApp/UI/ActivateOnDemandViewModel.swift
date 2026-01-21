@@ -17,7 +17,7 @@ class ActivateOnDemandViewModel {
             case .nonWiFiInterface:
                 #if os(iOS)
                 return tr("tunnelOnDemandCellular")
-                #elseif os(macOS)
+                #elseif os(macOS) || os(tvOS)
                 return tr("tunnelOnDemandEthernet")
                 #else
                 #error("Unimplemented")
@@ -114,7 +114,7 @@ extension ActivateOnDemandViewModel {
         case (false, true):
             #if os(iOS)
             return tr("tunnelOnDemandOptionCellularOnly")
-            #elseif os(macOS)
+            #elseif os(macOS) || os(tvOS)
             return tr("tunnelOnDemandOptionEthernetOnly")
             #else
             #error("Unimplemented")
@@ -122,7 +122,7 @@ extension ActivateOnDemandViewModel {
         case (true, true):
             #if os(iOS)
             return tr("tunnelOnDemandOptionWiFiOrCellular")
-            #elseif os(macOS)
+            #elseif os(macOS) || os(tvOS)
             return tr("tunnelOnDemandOptionWiFiOrEthernet")
             #else
             #error("Unimplemented")

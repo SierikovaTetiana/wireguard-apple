@@ -416,7 +416,7 @@ public class WireGuardAdapter {
     private func didReceivePathUpdate(path: Network.NWPath) {
         self.logHandler(.verbose, "Network change detected with \(path.status) route and interface order \(path.availableInterfaces)")
 
-        #if os(macOS)
+        #if os(macOS) || os(tvOS)
         if case .started(let handle, _) = self.state {
             wgBumpSockets(handle)
         }
