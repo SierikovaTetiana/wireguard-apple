@@ -44,6 +44,12 @@ public class WireGuardAdapter {
     /// Network routes monitor.
     private var networkMonitor: NWPathMonitor?
 
+    /// The path update waiting to be handled. See `schedulePathUpdate(_:)`.
+    private var pendingPathUpdate: DispatchWorkItem?
+
+    /// How long a path update waits for a newer one before it is handled.
+    private static let pathUpdateDebounceInterval: DispatchTimeInterval = .milliseconds(100)
+
     /// Packet tunnel provider.
     private weak var packetTunnelProvider: NEPacketTunnelProvider?
 
@@ -143,6 +149,7 @@ public class WireGuardAdapter {
 
         // Cancel network monitor
         networkMonitor?.cancel()
+        pendingPathUpdate?.cancel()
 
         // Shutdown the tunnel
         if case .started(let handle, _) = self.state {
@@ -183,7 +190,7 @@ public class WireGuardAdapter {
 
             let networkMonitor = NWPathMonitor()
             networkMonitor.pathUpdateHandler = { [weak self] path in
-                self?.didReceivePathUpdate(path: path)
+                self?.schedulePathUpdate(path)
             }
             networkMonitor.start(queue: self.workQueue)
 
@@ -227,6 +234,8 @@ public class WireGuardAdapter {
 
             self.networkMonitor?.cancel()
             self.networkMonitor = nil
+            self.pendingPathUpdate?.cancel()
+            self.pendingPathUpdate = nil
 
             self.state = .stopped
 
@@ -285,7 +294,107 @@ public class WireGuardAdapter {
         }
     }
 
+    /// Re-establishes the connection to the same server without stopping the tunnel: resolves the server hostname
+    /// again, points the peer at the result and opens new UDP sockets. Keys, the peer and the network settings stay the
+    /// same, so neither the system nor the app sees a change.
+    ///
+    /// Use it when the tunnel looks dead although the network is up, for example when the sockets are stuck on a network
+    /// that is gone, or the server moved to another address. Path updates never resolve the hostname again.
+    /// - Parameter completionHandler: completion handler, called on the adapter's queue.
+    public func reconnect(completionHandler: @escaping (WireGuardAdapterError?) -> Void) {
+        resolveEndpointsAgain { [weak self] resolvedSettingsGenerator in
+            guard let self = self else { return }
+            guard case .started(let handle, let settingsGenerator) = self.state else {
+                completionHandler(.invalidState)
+                return
+            }
+
+            let generator = resolvedSettingsGenerator ?? settingsGenerator
+            let (wgConfig, resolutionResults) = generator.endpointUapiConfiguration()
+            self.logEndpointResolutionResults(resolutionResults)
+
+            wgSetConfig(handle, wgConfig)
+            #if os(iOS)
+            wgDisableSomeRoamingForBrokenMobileSemantics(handle)
+            #endif
+            wgBumpSockets(handle)
+
+            self.state = .started(handle, generator)
+            self.logHandler(.verbose, "Reconnected to the endpoint with new sockets.")
+            completionHandler(nil)
+        }
+    }
+
+    /// Replaces the WireGuard backend with a new one for the same configuration, without stopping the tunnel: new
+    /// sockets on a new port, a new handshake, and the server hostname resolved again. The network settings stay the
+    /// same, so neither the system nor the app sees a change, but packets in flight are lost.
+    ///
+    /// Heavier than `reconnect(completionHandler:)`. Use it when `reconnect` did not help, for example when the backend
+    /// gave up opening its sockets.
+    /// - Parameter completionHandler: completion handler, called on the adapter's queue. On failure the adapter is left
+    ///   in the temporary shutdown state, and calling this method again retries.
+    public func restartBackend(completionHandler: @escaping (WireGuardAdapterError?) -> Void) {
+        resolveEndpointsAgain { [weak self] resolvedSettingsGenerator in
+            guard let self = self else { return }
+            let settingsGenerator: PacketTunnelSettingsGenerator
+            switch self.state {
+            case .started(let handle, let currentSettingsGenerator):
+                wgTurnOff(handle)
+                settingsGenerator = currentSettingsGenerator
+            case .temporaryShutdown(let currentSettingsGenerator):
+                settingsGenerator = currentSettingsGenerator
+            case .stopped:
+                completionHandler(.invalidState)
+                return
+            }
+
+            let generator = resolvedSettingsGenerator ?? settingsGenerator
+            let (wgConfig, resolutionResults) = generator.uapiConfiguration()
+            self.logEndpointResolutionResults(resolutionResults)
+
+            do {
+                self.state = .started(try self.startWireGuardBackend(wgConfig: wgConfig), generator)
+                self.logHandler(.verbose, "Restarted the backend.")
+                completionHandler(nil)
+            } catch let error as WireGuardAdapterError {
+                self.state = .temporaryShutdown(generator)
+                self.logHandler(.error, "Failed to restart backend: \(error.localizedDescription)")
+                completionHandler(error)
+            } catch {
+                fatalError()
+            }
+        }
+    }
+
     // MARK: - Private methods
+
+    /// Resolves the hostnames of the current configuration again, away from `workQueue`, because DNS can take long on a
+    /// bad network and path updates or `stop` must not wait for it. Calls `body` on `workQueue` with the new settings
+    /// generator, or `nil` if the tunnel is stopped or the hostnames could not be resolved.
+    private func resolveEndpointsAgain(then body: @escaping (PacketTunnelSettingsGenerator?) -> Void) {
+        workQueue.async {
+            let tunnelConfiguration: TunnelConfiguration
+            switch self.state {
+            case .started(_, let settingsGenerator), .temporaryShutdown(let settingsGenerator):
+                tunnelConfiguration = settingsGenerator.tunnelConfiguration
+            case .stopped:
+                body(nil)
+                return
+            }
+
+            DispatchQueue.global(qos: .utility).async {
+                var settingsGenerator: PacketTunnelSettingsGenerator?
+                do {
+                    settingsGenerator = try self.makeSettingsGenerator(with: tunnelConfiguration)
+                } catch {
+                    self.logHandler(.error, "Could not resolve the endpoints again, keeping the last known addresses: \(error.localizedDescription)")
+                }
+                self.workQueue.async {
+                    body(settingsGenerator)
+                }
+            }
+        }
+    }
 
     /// Setup WireGuard log handler.
     private func setupLogHandler() {
@@ -312,28 +421,33 @@ public class WireGuardAdapter {
     /// - Throws: an error of type `WireGuardAdapterError`.
     /// - Returns: `PacketTunnelSettingsGenerator`.
     private func setNetworkSettings(_ networkSettings: NEPacketTunnelNetworkSettings) throws {
+        // The system calls the completion handler on its own queue, possibly before we start waiting. A semaphore keeps
+        // that signal, while `NSCondition.signal()` without anyone waiting is lost and turns into the 5 second timeout.
+        let semaphore = DispatchSemaphore(value: 0)
+        let errorLock = NSLock()
         var systemError: Error?
-        let condition = NSCondition()
-
-        // Activate the condition
-        condition.lock()
-        defer { condition.unlock() }
 
         self.packetTunnelProvider?.setTunnelNetworkSettings(networkSettings) { error in
+            errorLock.lock()
             systemError = error
-            condition.signal()
+            errorLock.unlock()
+            semaphore.signal()
         }
 
         // Packet tunnel's `setTunnelNetworkSettings` times out in certain
         // scenarios & never calls the given callback.
         let setTunnelNetworkSettingsTimeout: TimeInterval = 5 // seconds
 
-        if condition.wait(until: Date().addingTimeInterval(setTunnelNetworkSettingsTimeout)) {
-            if let systemError = systemError {
-                throw WireGuardAdapterError.setNetworkSettings(systemError)
-            }
-        } else {
+        if semaphore.wait(timeout: .now() + setTunnelNetworkSettingsTimeout) == .timedOut {
             self.logHandler(.error, "setTunnelNetworkSettings timed out after 5 seconds; proceeding anyway")
+            return
+        }
+
+        errorLock.lock()
+        let error = systemError
+        errorLock.unlock()
+        if let error = error {
+            throw WireGuardAdapterError.setNetworkSettings(error)
         }
     }
 
@@ -409,6 +523,19 @@ public class WireGuardAdapter {
                 self.logHandler(.error, "Failed to resolve endpoint \(resolutionError.address): \(resolutionError.errorDescription ?? "(nil)")")
             }
         }
+    }
+
+    /// Switching between Wi-Fi and cellular delivers several path updates in a row. Handling each of them resets the
+    /// sockets again and again, so only the last update of a short burst is handled. Called on `workQueue`.
+    /// - Parameter path: new network path
+    private func schedulePathUpdate(_ path: Network.NWPath) {
+        pendingPathUpdate?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.pendingPathUpdate = nil
+            self?.didReceivePathUpdate(path: path)
+        }
+        pendingPathUpdate = workItem
+        workQueue.asyncAfter(deadline: .now() + Self.pathUpdateDebounceInterval, execute: workItem)
     }
 
     /// Helper method used by network path monitor.
