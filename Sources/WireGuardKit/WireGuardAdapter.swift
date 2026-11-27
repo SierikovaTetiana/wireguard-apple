@@ -36,6 +36,16 @@ private enum State {
 
     /// The tunnel is temporarily shutdown due to device going offline
     case temporaryShutdown(_ settingsGenerator: PacketTunnelSettingsGenerator)
+
+    /// The settings generator of the running configuration, or `nil` when stopped.
+    var settingsGenerator: PacketTunnelSettingsGenerator? {
+        switch self {
+        case .started(_, let settingsGenerator), .temporaryShutdown(let settingsGenerator):
+            return settingsGenerator
+        case .stopped:
+            return nil
+        }
+    }
 }
 
 public class WireGuardAdapter {
@@ -295,12 +305,14 @@ public class WireGuardAdapter {
     }
 
     /// Re-establishes the connection to the same server without stopping the tunnel: resolves the server hostname
-    /// again, points the peer at the result and opens new UDP sockets. Keys, the peer and the network settings stay the
-    /// same, so neither the system nor the app sees a change.
+    /// again, points the peer at the result and asks the backend for new UDP sockets. Keys, the peer and the network
+    /// settings stay the same, so neither the system nor the app sees a change.
     ///
     /// Use it when the tunnel looks dead although the network is up, for example when the sockets are stuck on a network
     /// that is gone, or the server moved to another address. Path updates never resolve the hostname again.
-    /// - Parameter completionHandler: completion handler, called on the adapter's queue.
+    /// - Parameter completionHandler: completion handler, called on the adapter's queue once the endpoint is updated and
+    ///   new sockets are requested. The backend replaces the sockets in the background and may give up (it logs it), so
+    ///   success here doesn't mean the tunnel passes traffic again. Not called if the adapter is deallocated meanwhile.
     public func reconnect(completionHandler: @escaping (WireGuardAdapterError?) -> Void) {
         resolveEndpointsAgain { [weak self] resolvedSettingsGenerator in
             guard let self = self else { return }
@@ -320,7 +332,7 @@ public class WireGuardAdapter {
             wgBumpSockets(handle)
 
             self.state = .started(handle, generator)
-            self.logHandler(.verbose, "Reconnected to the endpoint with new sockets.")
+            self.logHandler(.verbose, "Updated the endpoint and requested new sockets.")
             completionHandler(nil)
         }
     }
@@ -331,8 +343,10 @@ public class WireGuardAdapter {
     ///
     /// Heavier than `reconnect(completionHandler:)`. Use it when `reconnect` did not help, for example when the backend
     /// gave up opening its sockets.
-    /// - Parameter completionHandler: completion handler, called on the adapter's queue. On failure the adapter is left
-    ///   in the temporary shutdown state, and calling this method again retries.
+    /// - Parameter completionHandler: completion handler, called on the adapter's queue. Not called if the adapter is
+    ///   deallocated meanwhile. If starting the new backend fails, the adapter is left without a backend in the temporary
+    ///   shutdown state, and calling this method again retries. On iOS, while the network is offline, it does nothing
+    ///   and fails with `invalidState`: the adapter starts the backend itself when the network returns.
     public func restartBackend(completionHandler: @escaping (WireGuardAdapterError?) -> Void) {
         resolveEndpointsAgain { [weak self] resolvedSettingsGenerator in
             guard let self = self else { return }
@@ -342,6 +356,15 @@ public class WireGuardAdapter {
                 wgTurnOff(handle)
                 settingsGenerator = currentSettingsGenerator
             case .temporaryShutdown(let currentSettingsGenerator):
+                #if os(iOS)
+                // On iOS this state also means the network is offline. Starting now would override that; the next
+                // satisfiable path update starts the backend anyway.
+                if self.networkMonitor?.currentPath.status.isSatisfiable == false {
+                    self.logHandler(.verbose, "Not restarting the backend while the network is offline.")
+                    completionHandler(.invalidState)
+                    return
+                }
+                #endif
                 settingsGenerator = currentSettingsGenerator
             case .stopped:
                 completionHandler(.invalidState)
@@ -370,26 +393,33 @@ public class WireGuardAdapter {
 
     /// Resolves the hostnames of the current configuration again, away from `workQueue`, because DNS can take long on a
     /// bad network and path updates or `stop` must not wait for it. Calls `body` on `workQueue` with the new settings
-    /// generator, or `nil` if the tunnel is stopped or the hostnames could not be resolved.
+    /// generator, or `nil` if the tunnel is stopped, the hostnames could not be resolved, or the configuration changed
+    /// (`update`, `stop` and `start`) while resolving. Doesn't call `body` if the adapter is deallocated meanwhile.
     private func resolveEndpointsAgain(then body: @escaping (PacketTunnelSettingsGenerator?) -> Void) {
-        workQueue.async {
-            let tunnelConfiguration: TunnelConfiguration
-            switch self.state {
-            case .started(_, let settingsGenerator), .temporaryShutdown(let settingsGenerator):
-                tunnelConfiguration = settingsGenerator.tunnelConfiguration
-            case .stopped:
+        workQueue.async { [weak self] in
+            guard let self = self else { return }
+            guard let tunnelConfiguration = self.state.settingsGenerator?.tunnelConfiguration else {
                 body(nil)
                 return
             }
 
-            DispatchQueue.global(qos: .utility).async {
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self = self else { return }
                 var settingsGenerator: PacketTunnelSettingsGenerator?
                 do {
                     settingsGenerator = try self.makeSettingsGenerator(with: tunnelConfiguration)
                 } catch {
                     self.logHandler(.error, "Could not resolve the endpoints again, keeping the last known addresses: \(error.localizedDescription)")
                 }
-                self.workQueue.async {
+                self.workQueue.async { [weak self] in
+                    guard let self = self else { return }
+                    // The result describes the configuration from before the lookup. Applying it after a change would
+                    // bring the old peer back.
+                    guard self.state.settingsGenerator?.tunnelConfiguration === tunnelConfiguration else {
+                        self.logHandler(.verbose, "The configuration changed while resolving the endpoints; ignoring the result.")
+                        body(nil)
+                        return
+                    }
                     body(settingsGenerator)
                 }
             }
